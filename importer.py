@@ -41,6 +41,15 @@ def _get_node_input(node, *names):
     return None
 
 
+def _get_node_output(node, *names):
+    for name in names:
+        try:
+            return node.outputs[name]
+        except KeyError:
+            pass
+    return None
+
+
 def _set_node_input_default(node, value, *names):
     socket = _get_node_input(node, *names)
     if socket is not None:
@@ -57,6 +66,59 @@ def _set_custom_normals(mesh, normals):
     mesh.normals_split_custom_set(normals)
     if hasattr(mesh, 'use_auto_smooth'):
         mesh.use_auto_smooth = True
+
+
+def _new_vertex_color_node(nodes):
+    try:
+        node = nodes.new("ShaderNodeVertexColor")
+        node.layer_name = "Col"
+    except RuntimeError:
+        node = nodes.new("ShaderNodeAttribute")
+        node.attribute_name = "Col"
+    return node
+
+
+def _new_separate_color_node(nodes):
+    try:
+        return nodes.new('ShaderNodeSeparateColor')
+    except RuntimeError:
+        return nodes.new('ShaderNodeSeparateRGB')
+
+
+def _parse_egg_bool(values, default=True):
+    if not values:
+        return default
+
+    return str(values[0]).strip().lower() not in ('0', 'false', 'off', 'none')
+
+
+def _material_has_alpha_file(textures):
+    return any(getattr(texture, 'alpha_image', None) is not None for texture in textures)
+
+
+def _material_uses_double_sided_faces(prim, textures):
+    return prim.bface or _material_has_alpha_file(textures)
+
+
+def _get_alpha_blend_method(alpha, textures):
+    has_alpha_file = _material_has_alpha_file(textures)
+
+    if not alpha:
+        if has_alpha_file:
+            return 'HASHED'
+        return None
+
+    alpha = alpha.lower()
+    if alpha == 'off':
+        return 'OPAQUE'
+    elif alpha.startswith('ms'):
+        return 'HASHED'
+    elif alpha == 'binary':
+        return 'CLIP'
+    elif has_alpha_file:
+        return 'HASHED'
+    else:
+        return 'BLEND'
 
 
 class EggContext:
@@ -229,24 +291,38 @@ class EggContext:
 
         path = path.replace('/', os.sep)
 
-        # If it's a relative path, search in the location of the .egg first.
-        if not os.path.isabs(path) and self.search_dir and os.path.exists(os.path.join(self.search_dir, path)):
-            path = os.path.join(self.search_dir, path)
-            path = path.replace(os.sep + '.' + os.sep, os.sep)
-            image = bpy.data.images.load(path)
-            #image.filepath = path
-        else:
-            # Try loading it with the original path, just in case.
-            try:
-                image = bpy.data.images.load(path)
-            except RuntimeError:
-                # That failed, of course.  OK, create a new image with this
-                # filename, and issue an error.
-                image = bpy.data.images.new(os.path.basename(path), 1, 1)
-                image.source = 'FILE'
-                image.filepath = path
-                self.warn("Unable to find texture {}".format(path))
+        candidates = []
 
+        if not os.path.isabs(path) and self.search_dir:
+            # If it's a relative path, search in the location of the .egg first.
+            candidates.append(os.path.join(self.search_dir, path))
+            candidates.append(os.path.join(self.search_dir, os.path.basename(path)))
+
+        # Try loading it with the original path, just in case.
+        candidates.append(path)
+
+        seen_paths = set()
+        for candidate in candidates:
+            candidate = candidate.replace(os.sep + '.' + os.sep, os.sep)
+            if candidate in seen_paths:
+                continue
+            seen_paths.add(candidate)
+
+            if candidate != path and not os.path.exists(candidate):
+                continue
+
+            try:
+                image = bpy.data.images.load(candidate)
+                return image
+            except RuntimeError:
+                pass
+
+        # That failed, of course.  OK, create a new image with this filename,
+        # and issue a warning.
+        image = bpy.data.images.new(os.path.basename(path), 1, 1)
+        image.source = 'FILE'
+        image.filepath = path
+        self.warn("Unable to find texture {}".format(path))
         return image
 
     def assign_vertex_groups(self):
@@ -431,8 +507,8 @@ class EggMaterial:
     def _get_material_28(self, group, prim):
         """ Returns the material for the indicated primitive. """
 
-        bface = prim.bface
         textures = prim.textures
+        bface = _material_uses_double_sided_faces(prim, textures)
         alpha = prim.alpha_mode
 
         if group.have_vertex_colors:
@@ -480,18 +556,14 @@ class EggMaterial:
             bmat.blend_method = 'MULTIPLY'
         elif group.blend_mode == 'add':
             bmat.blend_method = 'ADD'
-        elif alpha:
-            alpha = alpha.lower()
-            if alpha == 'off':
-                bmat.blend_method = 'OPAQUE'
-            elif alpha.startswith('ms'):
-                bmat.blend_method = 'HASHED'
-            elif alpha == 'binary':
-                bmat.blend_method = 'CLIP'
-            else:
-                bmat.blend_method = 'BLEND'
+        else:
+            blend_method = _get_alpha_blend_method(alpha, textures)
+            if blend_method is not None:
+                bmat.blend_method = blend_method
 
         bmat.use_backface_culling = not bface
+        if bface and hasattr(bmat, 'show_transparent_back'):
+            bmat.show_transparent_back = True
 
         # If we have an emission color, or any textures, we need to build up
         # a node graph.
@@ -518,8 +590,7 @@ class EggMaterial:
         alpha_out = bsdf.inputs['Alpha']
 
         if use_vertex_color:
-            col_node = bmat.node_tree.nodes.new("ShaderNodeAttribute")
-            col_node.attribute_name = "Col"
+            col_node = _new_vertex_color_node(bmat.node_tree.nodes)
             bmat.node_tree.links.new(color_out, col_node.outputs["Color"])
 
         uv_nodes = {}
@@ -558,24 +629,40 @@ class EggMaterial:
             else:
                 uv_node = uv_nodes[uv_layer]
 
-            # Convert the Panda texture transform to the equivalent Blender
-            # transform.  Ignores rotation, shear, or axis remap.
-            m = texture.matrix
-            if m is not None:
-                map_node = bmat.node_tree.nodes.new("ShaderNodeMapping")
-                if bpy.app.version >= (2, 81):
-                    map_node.inputs['Scale'].default_value = (m[0][0], m[1][1], m[2][2])
-                    map_node.inputs['Location'].default_value = Vector((m[0][3], m[1][3], m[2][3]))
+            def link_texture_vector(node):
+                # Convert the Panda texture transform to the equivalent Blender
+                # transform.  Ignores rotation, shear, or axis remap.
+                m = texture.matrix
+                if m is not None:
+                    map_node = bmat.node_tree.nodes.new("ShaderNodeMapping")
+                    if bpy.app.version >= (2, 81):
+                        map_node.inputs['Scale'].default_value = (m[0][0], m[1][1], m[2][2])
+                        map_node.inputs['Location'].default_value = Vector((m[0][3], m[1][3], m[2][3]))
+                    else:
+                        map_node.scale = (m[0][0], m[1][1], m[2][2])
+                        map_node.translation = Vector((m[0][3], m[1][3], m[2][3]))
+                    bmat.node_tree.links.new(map_node.inputs['Vector'], uv_node.outputs['UV'])
+                    bmat.node_tree.links.new(node.inputs['Vector'], map_node.outputs['Vector'])
                 else:
-                    map_node.scale = (m[0][0], m[1][1], m[2][2])
-                    map_node.translation = Vector((m[0][3], m[1][3], m[2][3]))
-                bmat.node_tree.links.new(map_node.inputs['Vector'], uv_node.outputs['UV'])
-                bmat.node_tree.links.new(tex_node.inputs['Vector'], map_node.outputs['Vector'])
-            else:
-                bmat.node_tree.links.new(tex_node.inputs['Vector'], uv_node.outputs['UV'])
+                    bmat.node_tree.links.new(node.inputs['Vector'], uv_node.outputs['UV'])
+
+            link_texture_vector(tex_node)
 
             color = tex_node.outputs['Color']
             alpha = tex_node.outputs['Alpha']
+
+            if texture.alpha_image:
+                alpha_node = bmat.node_tree.nodes.new("ShaderNodeTexImage")
+                alpha_node.image = texture.alpha_image
+                alpha_node.extension = texture.texture.extension
+                if texture.minfilter and texture.minfilter.startswith("nearest"):
+                    alpha_node.interpolation = "Closest"
+                link_texture_vector(alpha_node)
+
+                alpha_sep_node = _new_separate_color_node(bmat.node_tree.nodes)
+                bmat.node_tree.links.new(alpha_sep_node.inputs[0], alpha_node.outputs['Color'])
+                alpha = _get_node_output(alpha_sep_node, 'R', 'Red')
+                has_alpha = True
 
             if texture.envtype == 'replace':
                 if has_color:
@@ -666,26 +753,26 @@ class EggMaterial:
             if texture.envtype == 'selector' and \
                (bmat.metallic != 0.0 or bmat.roughness is None or bmat.roughness != 0.0):
                 # This slot is, by convention, used for metallic-roughness.
-                sep_node = bmat.node_tree.nodes.new('ShaderNodeSeparateRGB')
+                sep_node = _new_separate_color_node(bmat.node_tree.nodes)
                 bmat.node_tree.links.new(sep_node.inputs[0], color)
 
                 if bmat.metallic != 1.0:
                     mul_node = bmat.node_tree.nodes.new("ShaderNodeMath")
                     mul_node.operation = 'MULTIPLY'
                     mul_node.inputs[1].default_value = bmat.metallic
-                    bmat.node_tree.links.new(mul_node.inputs[0], sep_node.outputs['B'])
+                    bmat.node_tree.links.new(mul_node.inputs[0], _get_node_output(sep_node, 'B', 'Blue'))
                     bmat.node_tree.links.new(bsdf.inputs['Metallic'], mul_node.outputs[0])
                 else:
-                    bmat.node_tree.links.new(bsdf.inputs['Metallic'], sep_node.outputs['B'])
+                    bmat.node_tree.links.new(bsdf.inputs['Metallic'], _get_node_output(sep_node, 'B', 'Blue'))
 
                 if bmat.roughness is not None and bmat.roughness != 1.0:
                     mul_node = bmat.node_tree.nodes.new("ShaderNodeMath")
                     mul_node.operation = 'MULTIPLY'
                     mul_node.inputs[1].default_value = bmat.roughness
-                    bmat.node_tree.links.new(mul_node.inputs[0], sep_node.outputs['G'])
+                    bmat.node_tree.links.new(mul_node.inputs[0], _get_node_output(sep_node, 'G', 'Green'))
                     bmat.node_tree.links.new(bsdf.inputs['Roughness'], mul_node.outputs[0])
                 else:
-                    bmat.node_tree.links.new(bsdf.inputs['Roughness'], sep_node.outputs['G'])
+                    bmat.node_tree.links.new(bsdf.inputs['Roughness'], _get_node_output(sep_node, 'G', 'Green'))
 
         # Assign each node to a column.  The method below ensures that
         # connections always flow from left to right, never right to left.
@@ -735,8 +822,8 @@ class EggMaterial:
         else:
             flat_color = prim.color or (1, 1, 1, 1)
 
-        bface = prim.bface
         textures = prim.textures
+        bface = _material_uses_double_sided_faces(prim, textures)
         alpha = prim.alpha_mode
 
         if len(textures) == 0 and self is EggPrimitive.default_material and not bface and not alpha:
@@ -775,15 +862,15 @@ class EggMaterial:
 
         if group.blend_mode and group.blend_mode == 'add':
             bmat.game_settings.alpha_blend = 'ADD'
-        elif alpha:
-            alpha = alpha.lower()
-            if alpha == 'off':
+        else:
+            blend_method = _get_alpha_blend_method(alpha, textures)
+            if blend_method == 'OPAQUE':
                 bmat.game_settings.alpha_blend = 'OPAQUE'
-            elif alpha.startswith('ms'):
+            elif blend_method == 'HASHED':
                 bmat.game_settings.alpha_blend = 'ALPHA_ANTIALIASING'
-            elif alpha == 'binary':
+            elif blend_method == 'CLIP':
                 bmat.game_settings.alpha_blend = 'CLIP'
-            else:
+            elif blend_method == 'BLEND':
                 bmat.game_settings.alpha_blend = 'ALPHA'
 
         bmat.game_settings.use_backface_culling = not bface
@@ -841,6 +928,7 @@ class EggTexture:
         self.color = [0, 0, 0, 1]
         self.minfilter = None
         self.magfilter = None
+        self.alpha_image = None
 
     def begin_child(self, context, type, name, values):
         type = type.upper()
@@ -874,6 +962,10 @@ class EggTexture:
             elif name == 'alpha':
                 if values[0].lower() == 'premultiplied':
                     self.texture.image.alpha_mode = 'PREMUL'
+
+            elif name == 'alpha-file' or name == 'alpha_file':
+                self.alpha_image = context.load_image(values[0])
+                self.alpha_image.colorspace_settings.name = 'Non-Color'
 
             elif name == 'blend':
                 self.blend = values[0].lower()
@@ -1065,6 +1157,9 @@ class EggPrimitive:
 
             if name == 'alpha':
                 self.alpha_mode = values[0].lower().replace('-', '_')
+
+        elif type == 'BFACE':
+            self.bface = _parse_egg_bool(values)
 
         elif type == 'TREF':
             self.textures.append(context.textures[values[0]])
@@ -1279,6 +1374,17 @@ class EggGroup(EggGroupNode):
         """ Returns true if this begins a new coordinate space. """
 
         return self.instance_type or (self.has_billboard and not self.has_billboard_center)
+
+    def _is_structural_empty_group(self, data):
+        return not self.name and \
+            data is None and \
+            not self.matrix and \
+            not self.default_pose and \
+            not self.properties and \
+            not self.dart and \
+            not self.external_instance and \
+            not self.shape_keys and \
+            not self.is_instance_type()
 
     def get_bvert(self, vert):
         # Vertices are keyed by position only, since normals and UVs are
@@ -1546,6 +1652,13 @@ class EggGroup(EggGroupNode):
                 # object.
                 self.mesh_object = bpy.data.objects.new("", data)
             data = bpy.data.armatures.new(self.name)
+
+        if self._is_structural_empty_group(data):
+            if not inv_matrix:
+                inv_matrix = context.inv_cs_matrix
+            for child in self.children:
+                child.build_tree(context, parent, inv_matrix, under_dart or self.dart)
+            return
 
         object = bpy.data.objects.new(self.name, data)
         object.parent = parent
