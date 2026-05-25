@@ -19,6 +19,46 @@ else:
         return a * b
 
 
+def _set_polygon_loop_range(mesh, poly_index, loop_start, loop_total):
+    poly = mesh.polygons[poly_index]
+    poly.loop_start = loop_start
+
+    try:
+        poly.loop_total = loop_total
+    except AttributeError:
+        if poly.loop_total != loop_total:
+            loop_totals = [poly.loop_total for poly in mesh.polygons]
+            loop_totals[poly_index] = loop_total
+            mesh.polygons.foreach_set('loop_total', loop_totals)
+
+
+def _get_node_input(node, *names):
+    for name in names:
+        try:
+            return node.inputs[name]
+        except KeyError:
+            pass
+    return None
+
+
+def _set_node_input_default(node, value, *names):
+    socket = _get_node_input(node, *names)
+    if socket is not None:
+        socket.default_value = value
+    return socket
+
+
+def _calculate_mesh_normals(mesh):
+    if hasattr(mesh, 'calc_normals'):
+        mesh.calc_normals()
+
+
+def _set_custom_normals(mesh, normals):
+    mesh.normals_split_custom_set(normals)
+    if hasattr(mesh, 'use_auto_smooth'):
+        mesh.use_auto_smooth = True
+
+
 class EggContext:
 
     # These matrices are used for coordinate system conversion.
@@ -205,7 +245,7 @@ class EggContext:
                 image = bpy.data.images.new(os.path.basename(path), 1, 1)
                 image.source = 'FILE'
                 image.filepath = path
-                self.error("Unable to find texture {}".format(path))
+                self.warn("Unable to find texture {}".format(path))
 
         return image
 
@@ -464,13 +504,15 @@ class EggMaterial:
     def _make_nodes(self, bmat, textures, use_vertex_color):
         bmat.use_nodes = True
         bsdf = bmat.node_tree.nodes["Principled BSDF"]
-        bsdf.inputs["Roughness"].default_value = bmat.roughness
-        bsdf.inputs["Metallic"].default_value = bmat.metallic
+        _set_node_input_default(bsdf, bmat.roughness, "Roughness")
+        _set_node_input_default(bsdf, bmat.metallic, "Metallic")
         if self.ior is not None:
-            bsdf.inputs["IOR"].default_value = self.ior
-        bsdf.inputs["Emission"].default_value = self.emit
+            _set_node_input_default(bsdf, self.ior, "IOR")
+        _set_node_input_default(bsdf, self.emit, "Emission", "Emission Color")
+        if any(self.emit[:3]):
+            _set_node_input_default(bsdf, 1.0, "Emission Strength")
         if not any(self.spec[:3]):
-            bsdf.inputs["Specular"].default_value = 0.0
+            _set_node_input_default(bsdf, 0.0, "Specular", "Specular IOR Level")
 
         color_out = bsdf.inputs['Base Color']
         alpha_out = bsdf.inputs['Alpha']
@@ -597,23 +639,29 @@ class EggMaterial:
                 bmat.node_tree.links.new(bsdf.inputs['Normal'], color)
 
             if texture.envtype in ('gloss', 'modulate_gloss', 'normal_gloss'):
-                bmat.node_tree.links.new(bsdf.inputs['Specular'], alpha)
+                specular_out = _get_node_input(bsdf, 'Specular', 'Specular IOR Level')
+                if specular_out is not None:
+                    bmat.node_tree.links.new(specular_out, alpha)
 
             if texture.envtype in ('glow', 'modulate_glow'):
-                bmat.node_tree.links.new(bsdf.inputs['Emission Strength'], alpha)
+                emission_strength_out = _get_node_input(bsdf, 'Emission Strength')
+                if emission_strength_out is not None:
+                    bmat.node_tree.links.new(emission_strength_out, alpha)
 
             if texture.envtype == 'emission':
+                emission_out = _get_node_input(bsdf, 'Emission', 'Emission Color')
                 # Multiply in the emission color, if we have one.
-                if self.emit and tuple(self.emit[:3]) != (1, 1, 1):
+                if emission_out and self.emit and tuple(self.emit[:3]) != (1, 1, 1):
                     mul_node = bmat.node_tree.nodes.new('ShaderNodeMixRGB')
                     mul_node.blend_type = 'MULTIPLY'
                     mul_node.inputs['Fac'].default_value = 1.0
                     mul_node.inputs['Color2'].default_value = self.emit
 
                     bmat.node_tree.links.new(mul_node.inputs['Color1'], color)
-                    bmat.node_tree.links.new(bsdf.inputs['Emission'], mul_node.outputs[0])
-                else:
-                    bmat.node_tree.links.new(bsdf.inputs['Emission'], mul_node.outputs[0])
+                    bmat.node_tree.links.new(emission_out, mul_node.outputs[0])
+                elif emission_out:
+                    bmat.node_tree.links.new(emission_out, color)
+                _set_node_input_default(bsdf, 1.0, 'Emission Strength')
 
             if texture.envtype == 'selector' and \
                (bmat.metallic != 0.0 or bmat.roughness is None or bmat.roughness != 0.0):
@@ -820,7 +868,7 @@ class EggTexture:
 
             elif name == 'minfilter':
                 self.minfilter = values[0].lower()
-                if 'mipmap' in self.minfilter:
+                if 'mipmap' in self.minfilter and hasattr(self.texture, 'use_mipmap'):
                     self.texture.use_mipmap = True
 
             elif name == 'alpha':
@@ -1423,8 +1471,7 @@ class EggGroup(EggGroupNode):
                 mesh.uv_layers[name].data[loop.index].uv = uv
 
         # Reference those loops in the polygon.
-        poly.loop_start = loop_offset
-        poly.loop_total = len(prim.indices)
+        _set_polygon_loop_range(mesh, poly_index, loop_offset, len(prim.indices))
 
         # Assign the highest priority texture that uses a given UV set to
         # the UV texture.  If there are multiple textures with the same
@@ -1476,7 +1523,7 @@ class EggGroup(EggGroupNode):
             if self.have_normals:
                 # Check if the mesh just uses smooth normals.  If so, don't
                 # bother importing custom normals.
-                data.calc_normals()
+                _calculate_mesh_normals(data)
                 max_diff = 0
                 for normal1, l in zip(self.normals, data.loops):
                     normal2 = data.vertices[l.vertex_index].normal
@@ -1484,8 +1531,7 @@ class EggGroup(EggGroupNode):
                     max_diff = max(diff, max_diff)
 
                 if max_diff > 0.01:
-                    data.normals_split_custom_set(self.normals)
-                    data.use_auto_smooth = True
+                    _set_custom_normals(data, self.normals)
 
             if self.have_vertex_colors:
                 cols = data.vertex_colors.new()
