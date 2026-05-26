@@ -166,6 +166,38 @@ def _iter_texture_candidates(path, search_dir):
     yield path, False
 
 
+def _context_setting_enabled(context, name):
+    settings = getattr(context, 'settings', None)
+    return settings is None or getattr(settings, name)
+
+
+class EggImportSettings:
+    __slots__ = (
+        'load_textures',
+        'import_materials',
+        'import_vertex_colors',
+        'import_custom_normals',
+        'import_shape_keys',
+        'import_animations',
+        'import_vertex_groups',
+        'import_texture_settings',
+        'import_alpha_masks',
+        'validate_meshes',
+    )
+
+    def __init__(self):
+        self.load_textures = True
+        self.import_materials = True
+        self.import_vertex_colors = True
+        self.import_custom_normals = True
+        self.import_shape_keys = True
+        self.import_animations = True
+        self.import_vertex_groups = True
+        self.import_texture_settings = True
+        self.import_alpha_masks = True
+        self.validate_meshes = True
+
+
 class EggContext:
 
     # These matrices are used for coordinate system conversion.
@@ -180,6 +212,7 @@ class EggContext:
                          (0.0, 0.0, 0.0, 1.0)))
 
     def __init__(self):
+        self.settings = EggImportSettings()
         self.vertex_pools = {}
         self.materials = {}
         self.textures = {}
@@ -328,6 +361,9 @@ class EggContext:
     def load_image(self, path):
         """ Loads an image from disk as Blender image. """
 
+        if not self.settings.load_textures:
+            return None
+
         if sys.platform == 'win32':
             # Convert an absolute Panda-style path to a Windows path.
             if len(path) > 3 and path[0] == '/' and path[2] == '/':
@@ -362,6 +398,9 @@ class EggContext:
 
     def assign_vertex_groups(self):
         """ Called at the end, to assign all of the vertex groups. """
+
+        if not self.settings.import_vertex_groups:
+            return
 
         for name, vertex_ref in self.group_vertex_refs:
             vpool = self.vertex_pools[vertex_ref.pool]
@@ -953,6 +992,9 @@ class EggTexture:
     def __init__(self, name, image):
         self.texture = bpy.data.textures.new(name, 'IMAGE')
         self.texture.image = image
+        self.wrap_u = None
+        self.wrap_v = None
+        self.wrap_w = None
         self.format = None
         self.envtype = 'modulate'
         self.uv_name = None
@@ -965,42 +1007,64 @@ class EggTexture:
         self.magfilter = None
         self.alpha_image = None
 
+    def _set_wrap_mode(self, name, value):
+        value = value.lower().replace('-', '_')
+        if name == 'wrap':
+            self.wrap_u = value
+            self.wrap_v = value
+            self.wrap_w = value
+        elif name == 'wrapu':
+            self.wrap_u = value
+        elif name == 'wrapv':
+            self.wrap_v = value
+        elif name == 'wrapw':
+            self.wrap_w = value
+
+        wrap_modes = [
+            wrap for wrap in (self.wrap_u, self.wrap_v, self.wrap_w)
+            if wrap is not None
+        ]
+        if any(wrap in ('border_color', 'border_colour') for wrap in wrap_modes):
+            self.texture.extension = 'CLIP'
+        elif any(wrap == 'clamp' for wrap in wrap_modes):
+            self.texture.extension = 'EXTEND'
+        elif wrap_modes:
+            self.texture.extension = 'REPEAT'
+
     def begin_child(self, context, type, name, values):
         type = type.upper()
 
         if type in ('SCALAR', 'CHAR*'):
             name = name.lower()
 
-            if name == 'wrap':
-                value = values[0].lower()
-                if value == 'repeat':
-                    self.texture.extension = 'REPEAT'
-                elif value == 'clamp':
-                    self.texture.extension = 'EXTEND'
-                elif value in ('border_color', 'border-color'):
-                    self.texture.extension = 'CLIP'
+            if name in ('wrap', 'wrapu', 'wrapv', 'wrapw'):
+                if _context_setting_enabled(context, 'import_texture_settings'):
+                    self._set_wrap_mode(name, values[0])
 
             elif name == 'format':
                 self.format = values[0].lower().replace('-', '_')
 
             elif name == 'envtype':
                 self.envtype = values[0].lower().replace('-', '_')
-                if self.envtype in ('normal', 'normal_height', 'normal_gloss'):
+                if self.texture.image and self.envtype in ('normal', 'normal_height', 'normal_gloss'):
                     self.texture.use_normal_map = True
                     self.texture.image.colorspace_settings.name = 'Non-Color'
 
             elif name == 'minfilter':
-                self.minfilter = values[0].lower()
-                if 'mipmap' in self.minfilter and hasattr(self.texture, 'use_mipmap'):
-                    self.texture.use_mipmap = True
+                if _context_setting_enabled(context, 'import_texture_settings'):
+                    self.minfilter = values[0].lower()
+                    if 'mipmap' in self.minfilter and hasattr(self.texture, 'use_mipmap'):
+                        self.texture.use_mipmap = True
 
             elif name == 'alpha':
-                if values[0].lower() == 'premultiplied':
+                if self.texture.image and values[0].lower() == 'premultiplied':
                     self.texture.image.alpha_mode = 'PREMUL'
 
             elif name == 'alpha-file' or name == 'alpha_file':
-                self.alpha_image = context.load_image(values[0])
-                self.alpha_image.colorspace_settings.name = 'Non-Color'
+                if _context_setting_enabled(context, 'import_alpha_masks'):
+                    self.alpha_image = context.load_image(values[0])
+                    if self.alpha_image:
+                        self.alpha_image.colorspace_settings.name = 'Non-Color'
 
             elif name == 'blend':
                 self.blend = values[0].lower()
@@ -1099,10 +1163,12 @@ class EggVertex:
         type = type.upper()
 
         if type == 'NORMAL':
-            self.normal = tuple(parse_number(v) for v in values)
+            if _context_setting_enabled(context, 'import_custom_normals'):
+                self.normal = tuple(parse_number(v) for v in values)
 
         elif type == 'RGBA':
-            self.color = tuple(parse_number(v) for v in values)
+            if _context_setting_enabled(context, 'import_vertex_colors'):
+                self.color = tuple(parse_number(v) for v in values)
 
         elif type == 'UV':
             self.uv_map[name or DEFAULT_UV_NAME] = [parse_number(v) for v in values]
@@ -1111,9 +1177,10 @@ class EggVertex:
             self.aux_map[name] = [parse_number(v) for v in values]
 
         elif type == 'DXYZ':
-            if not name:
-                name = values.pop(0)
-            self.dxyzs[name] = tuple(parse_number(v) for v in values)
+            if _context_setting_enabled(context, 'import_shape_keys'):
+                if not name:
+                    name = values.pop(0)
+                self.dxyzs[name] = tuple(parse_number(v) for v in values)
 
     def __hash__(self):
         return hash(self.pos)
@@ -1197,10 +1264,12 @@ class EggPrimitive:
             self.bface = _parse_egg_bool(values)
 
         elif type == 'TREF':
-            self.textures.append(context.textures[values[0]])
+            if _context_setting_enabled(context, 'import_materials'):
+                self.textures.append(context.textures[values[0]])
 
         elif type == 'MREF':
-            self.material = context.materials[values[0]]
+            if _context_setting_enabled(context, 'import_materials'):
+                self.material = context.materials[values[0]]
 
         elif type == 'NORMAL':
             self.normal = tuple(parse_number(v) for v in values)
@@ -1303,10 +1372,14 @@ class EggGroupNode(EggNode):
             assert len(values) == 1
             context.set_coordinate_system(values[0])
         elif type == 'TEXTURE':
+            if not context.settings.import_materials:
+                return
             tex = EggTexture(name, context.load_image(values[0]))
             context.textures[name] = tex
             return tex
         elif type == 'MATERIAL':
+            if not context.settings.import_materials:
+                return
             mat = EggMaterial(name)
             context.materials[name] = mat
             return mat
@@ -1582,26 +1655,28 @@ class EggGroup(EggGroupNode):
 
             loop.vertex_index = self.get_bvert(vertex)
 
-            vertex_normal = vertex.normal
-            if vertex_normal:
-                self.have_normals = True
-                self.normals.append(vertex_normal or poly_normal)
-                poly.use_smooth = True
-            else:
-                self.normals.append(vertex_normal or poly_normal)
+            if context.settings.import_custom_normals:
+                vertex_normal = vertex.normal
+                if vertex_normal:
+                    self.have_normals = True
+                    self.normals.append(vertex_normal or poly_normal)
+                    poly.use_smooth = True
+                else:
+                    self.normals.append(vertex_normal or poly_normal)
 
-            if bpy.app.version >= (2, 79, 7):
-                if vertex.color:
-                    self.have_vertex_colors = True
-                    self.vertex_colors += vertex.color
+            if context.settings.import_vertex_colors:
+                if bpy.app.version >= (2, 79, 7):
+                    if vertex.color:
+                        self.have_vertex_colors = True
+                        self.vertex_colors += vertex.color
+                    else:
+                        self.vertex_colors += (1, 1, 1, 1)
                 else:
-                    self.vertex_colors += (1, 1, 1, 1)
-            else:
-                if vertex.color:
-                    self.have_vertex_colors = True
-                    self.vertex_colors += vertex.color[:3]
-                else:
-                    self.vertex_colors += (1, 1, 1)
+                    if vertex.color:
+                        self.have_vertex_colors = True
+                        self.vertex_colors += vertex.color[:3]
+                    else:
+                        self.vertex_colors += (1, 1, 1)
 
             for name, uv in vertex.uv_map.items():
                 if name not in mesh.uv_layers:
@@ -1617,7 +1692,7 @@ class EggGroup(EggGroupNode):
         # Assign the highest priority texture that uses a given UV set to
         # the UV texture.  If there are multiple textures with the same
         # priority, use the first one.
-        if bpy.app.version < (2, 80):
+        if context.settings.import_materials and bpy.app.version < (2, 80):
             set_textures = {}
             for texture in prim.textures:
                 uv_name = texture.uv_name or DEFAULT_UV_NAME
@@ -1635,15 +1710,17 @@ class EggGroup(EggGroupNode):
                     set_textures[uv_name] = texture
                     uv_texture.data[poly_index].image = texture.texture.image
 
-        # Check if we already have a material for this combination.
-        bmat = prim.material.get_material(self, prim)
-        if bmat in self.materials:
-            index = self.materials.index(bmat)
-        else:
-            index = len(self.materials)
-            self.materials.append(bmat)
-            mesh.materials.append(bmat)
-        poly.material_index = index
+        if context.settings.import_materials:
+            # Check if we already have a material for this combination.
+            bmat = prim.material.get_material(self, prim)
+            if bmat is not None:
+                if bmat in self.materials:
+                    index = self.materials.index(bmat)
+                else:
+                    index = len(self.materials)
+                    self.materials.append(bmat)
+                    mesh.materials.append(bmat)
+                poly.material_index = index
 
     def build_tree(self, context, parent, inv_matrix=None, under_dart=False):
         """ Walks the hierarchy of groups and builds the Blender object graph.
@@ -1661,7 +1738,7 @@ class EggGroup(EggGroupNode):
             else:
                 data.update(calc_edges=True, calc_tessface=True)
 
-            if self.have_normals:
+            if context.settings.import_custom_normals and self.have_normals:
                 # Check if the mesh just uses smooth normals.  If so, don't
                 # bother importing custom normals.
                 _calculate_mesh_normals(data)
@@ -1674,11 +1751,11 @@ class EggGroup(EggGroupNode):
                 if max_diff > 0.01:
                     _set_custom_normals(data, self.normals)
 
-            if self.have_vertex_colors:
+            if context.settings.import_vertex_colors and self.have_vertex_colors:
                 cols = data.vertex_colors.new()
                 cols.data.foreach_set('color', self.vertex_colors)
 
-            if data.validate(verbose=True):
+            if context.settings.validate_meshes and data.validate(verbose=True):
                 context.info("Corrected invalid geometry in mesh '{}'.".format(data.name))
 
         if self.dart and not under_dart:
@@ -1762,7 +1839,8 @@ class EggGroup(EggGroupNode):
 
         # Awkward, but it seems there's no other way to set a game property
         # or create bones or add shape keys.
-        if self.properties or self.dart or self.shape_keys:
+        import_shape_keys = context.settings.import_shape_keys
+        if self.properties or self.dart or (import_shape_keys and self.shape_keys):
             if bpy.app.version >= (2, 80):
                 active = bpy.context.view_layer.objects.active
                 bpy.context.view_layer.objects.active = object
@@ -1775,7 +1853,7 @@ class EggGroup(EggGroupNode):
                     bpy.ops.object.game_property_new(type='STRING', name=name)
                     object.game.properties[name].value = value
 
-            if self.shape_keys:
+            if import_shape_keys and self.shape_keys:
                 # Add the basis key first.
                 bpy.ops.object.shape_key_add()
                 basis_data = bpy.context.object.active_shape_key.data
@@ -1993,6 +2071,9 @@ class EggBundle(EggTable):
             self.morph = child
 
     def build_tree(self, context, parent=None, inv_matrix=None, under_dart=False):
+        if not context.settings.import_animations:
+            return
+
         if self.skeleton:
             self.action = bpy.data.actions.new(self.name)
             self.action.use_fake_user = True

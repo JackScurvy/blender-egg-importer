@@ -45,6 +45,16 @@ class IMPORT_OT_egg(bpy.types.Operator, ImportHelper):
 
     load_external: props.BoolProperty(name="Load external references", description="Loads other .egg files referenced by this file as separate scenes, and instantiates them using DupliGroups.")
     auto_bind: props.BoolProperty(name="Auto bind", default=True, description="Automatically tries to bind actions to armatures.")
+    import_textures: props.BoolProperty(name="Textures", default=True, description="Load texture image files referenced by the .egg.")
+    import_materials: props.BoolProperty(name="Materials", default=True, description="Create Blender materials and shader nodes from .egg material and texture state.")
+    import_vertex_colors: props.BoolProperty(name="Vertex colors", default=True, description="Import per-vertex color data.")
+    import_custom_normals: props.BoolProperty(name="Custom normals", default=True, description="Import explicit .egg normal data instead of letting Blender calculate normals.")
+    import_shape_keys: props.BoolProperty(name="Shape keys", default=True, description="Import DXYZ morph targets as Blender shape keys.")
+    import_animations: props.BoolProperty(name="Animations", default=True, description="Import animation tables and bind them to matching armatures.")
+    import_vertex_groups: props.BoolProperty(name="Vertex groups", default=True, description="Import joint and group vertex membership as Blender vertex groups.")
+    import_texture_settings: props.BoolProperty(name="Texture settings", default=True, description="Import texture filter and wrapping settings.")
+    import_alpha_masks: props.BoolProperty(name="Alpha masks", default=True, description="Import separate alpha-file textures and connect them to material alpha.")
+    validate_meshes: props.BoolProperty(name="Validate meshes", default=True, description="Run Blender mesh validation to clean duplicate or invalid geometry after import.")
 
     def execute(self, context):
         context = importer.EggContext()
@@ -52,6 +62,16 @@ class IMPORT_OT_egg(bpy.types.Operator, ImportHelper):
         context.warn = lambda msg: self.report({'WARNING'}, context.prefix_message(msg))
         context.error = lambda msg: self.report({'ERROR'}, context.prefix_message(msg))
         context.search_dir = self.directory
+        context.settings.load_textures = self.import_textures
+        context.settings.import_materials = self.import_materials
+        context.settings.import_vertex_colors = self.import_vertex_colors
+        context.settings.import_custom_normals = self.import_custom_normals
+        context.settings.import_shape_keys = self.import_shape_keys
+        context.settings.import_animations = self.import_animations
+        context.settings.import_vertex_groups = self.import_vertex_groups
+        context.settings.import_texture_settings = self.import_texture_settings
+        context.settings.import_alpha_masks = self.import_alpha_masks
+        context.settings.validate_meshes = self.validate_meshes
         roots = []
 
         for file in self.files:
@@ -66,7 +86,7 @@ class IMPORT_OT_egg(bpy.types.Operator, ImportHelper):
         if self.load_external:
             context.load_external_references()
 
-        if self.auto_bind:
+        if self.auto_bind and context.settings.import_animations:
             context.auto_bind()
 
         context.final_report()
@@ -83,6 +103,21 @@ class IMPORT_OT_egg(bpy.types.Operator, ImportHelper):
         row.prop(self, "load_external")
         row = layout.row()
         row.prop(self, "auto_bind")
+        row = layout.row()
+        row.prop(self, "import_textures")
+        row.prop(self, "import_materials")
+        row = layout.row()
+        row.prop(self, "import_vertex_colors")
+        row.prop(self, "import_custom_normals")
+        row = layout.row()
+        row.prop(self, "import_shape_keys")
+        row.prop(self, "import_animations")
+        row = layout.row()
+        row.prop(self, "import_vertex_groups")
+        row.prop(self, "import_texture_settings")
+        row = layout.row()
+        row.prop(self, "import_alpha_masks")
+        row.prop(self, "validate_meshes")
 
 
 def menu_func(self, context):
