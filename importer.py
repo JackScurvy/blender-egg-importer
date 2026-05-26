@@ -121,6 +121,51 @@ def _get_alpha_blend_method(alpha, textures):
         return 'BLEND'
 
 
+def _iter_parent_dirs(path, max_depth=8):
+    path = os.path.abspath(path)
+
+    for _ in range(max_depth + 1):
+        yield path
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+
+
+def _texture_path_suffixes(path):
+    parts = [
+        part for part in path.replace('\\', '/').split('/')
+        if part and part != '.'
+    ]
+
+    while parts and parts[0] == '..':
+        parts.pop(0)
+
+    suffixes = []
+    seen = set()
+    for index in range(len(parts) - 1):
+        suffix = os.path.join(*parts[index:])
+        if suffix not in seen:
+            suffixes.append(suffix)
+            seen.add(suffix)
+
+    return suffixes
+
+
+def _iter_texture_candidates(path, search_dir):
+    if not os.path.isabs(path) and search_dir:
+        yield os.path.join(search_dir, path), True
+
+        for suffix in _texture_path_suffixes(path):
+            for parent in _iter_parent_dirs(search_dir):
+                yield os.path.join(parent, suffix), True
+
+        yield os.path.join(search_dir, os.path.basename(path)), True
+
+    # Try loading it with the original path, just in case Blender can resolve it.
+    yield path, False
+
+
 class EggContext:
 
     # These matrices are used for coordinate system conversion.
@@ -291,24 +336,14 @@ class EggContext:
 
         path = path.replace('/', os.sep)
 
-        candidates = []
-
-        if not os.path.isabs(path) and self.search_dir:
-            # If it's a relative path, search in the location of the .egg first.
-            candidates.append(os.path.join(self.search_dir, path))
-            candidates.append(os.path.join(self.search_dir, os.path.basename(path)))
-
-        # Try loading it with the original path, just in case.
-        candidates.append(path)
-
         seen_paths = set()
-        for candidate in candidates:
-            candidate = candidate.replace(os.sep + '.' + os.sep, os.sep)
+        for candidate, require_exists in _iter_texture_candidates(path, self.search_dir):
+            candidate = os.path.normpath(candidate)
             if candidate in seen_paths:
                 continue
             seen_paths.add(candidate)
 
-            if candidate != path and not os.path.exists(candidate):
+            if require_exists and not os.path.exists(candidate):
                 continue
 
             try:
