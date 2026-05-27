@@ -68,6 +68,59 @@ def _set_custom_normals(mesh, normals):
         mesh.use_auto_smooth = True
 
 
+def _configure_bone_deform_state(context, bone, is_weighted):
+    if is_weighted:
+        return
+
+    if hasattr(bone, 'use_deform'):
+        bone.use_deform = False
+
+    if context.settings.hide_unweighted_bones and hasattr(bone, 'hide'):
+        bone.hide = True
+
+
+def _bind_action_to_datablock(action, datablock):
+    if datablock is None:
+        return
+
+    if not datablock.animation_data:
+        datablock.animation_data_create()
+    datablock.animation_data.action = action
+
+
+def _new_action_fcurve(action, datablock, data_path, index=0, group_name=""):
+    if hasattr(action, 'fcurves'):
+        return action.fcurves.new(data_path, index=index)
+
+    if datablock is None:
+        raise AttributeError("Blender layered actions require an assigned datablock")
+
+    return action.fcurve_ensure_for_datablock(
+        datablock,
+        data_path,
+        index=index,
+        group_name=group_name,
+    )
+
+
+def _set_action_id_root(action, id_root):
+    if hasattr(action, 'id_root'):
+        action.id_root = id_root
+
+
+def _find_shape_key_datablock(names):
+    names = list(names)
+    if not names:
+        return None
+
+    for shape_keys in bpy.data.shape_keys:
+        key_blocks = shape_keys.key_blocks
+        if all(name in key_blocks for name in names):
+            return shape_keys
+
+    return None
+
+
 def _new_vertex_color_node(nodes):
     try:
         node = nodes.new("ShaderNodeVertexColor")
@@ -183,6 +236,9 @@ class EggImportSettings:
         'import_texture_settings',
         'import_alpha_masks',
         'validate_meshes',
+        'lod_mode',
+        'import_collision_meshes',
+        'hide_unweighted_bones',
     )
 
     def __init__(self):
@@ -196,6 +252,9 @@ class EggImportSettings:
         self.import_texture_settings = True
         self.import_alpha_masks = True
         self.validate_meshes = True
+        self.lod_mode = 'ALL'
+        self.import_collision_meshes = True
+        self.hide_unweighted_bones = True
 
 
 class EggContext:
@@ -469,9 +528,7 @@ class EggContext:
 
         for name, object in self.character_objects.items():
             if name in self.bundle_actions:
-                if not object.animation_data:
-                    object.animation_data_create()
-                object.animation_data.action = self.bundle_actions[name]
+                _bind_action_to_datablock(self.bundle_actions[name], object)
 
 
 class EggRenderMode:
@@ -1148,6 +1205,36 @@ class EggTransform:
                         (v[3], v[7], v[11], v[15]))), self.matrix)
 
 
+class EggLodDistance:
+    __slots__ = 'switch_in', 'switch_out', 'fade', 'center'
+
+    def __init__(self, values):
+        parsed = [parse_number(value) for value in values]
+        self.switch_in = parsed[0] if len(parsed) > 0 else 0
+        self.switch_out = parsed[1] if len(parsed) > 1 else 0
+        self.fade = parsed[2] if len(parsed) > 2 else None
+        self.center = (0, 0, 0)
+
+    def begin_child(self, context, type, name, values):
+        if type.upper() == 'VERTEX':
+            self.center = tuple(parse_number(value) for value in values[:3])
+
+
+class EggSwitchCondition:
+    __slots__ = 'distance',
+
+    def __init__(self):
+        self.distance = None
+
+    def begin_child(self, context, type, name, values):
+        if type.upper() == 'DISTANCE':
+            return EggLodDistance(values)
+
+    def end_child(self, context, type, name, child):
+        if isinstance(child, EggLodDistance):
+            self.distance = child
+
+
 class EggVertex:
     __slots__ = 'pos', 'normal', 'color', 'uv_map', 'aux_map', 'dxyzs'
 
@@ -1422,22 +1509,80 @@ class EggGroupNode(EggNode):
         if isinstance(child, EggNode):
             self.children.append(child)
 
+    def _get_build_children(self, context):
+        children = list(self.children)
+
+        if not context.settings.import_collision_meshes:
+            children = [
+                child for child in children
+                if not (isinstance(child, EggGroup) and child._is_collision_group())
+            ]
+
+        if context.settings.lod_mode != 'HIGHEST':
+            return children
+
+        best_lods = {}
+        for child in children:
+            if not isinstance(child, EggGroup) or child.lod is None:
+                continue
+
+            key = child.lod.center
+            best = best_lods.get(key)
+            if best is None or child.lod.switch_in < best.lod.switch_in:
+                best_lods[key] = child
+
+        if not best_lods:
+            return children
+
+        keep_lods = set(id(child) for child in best_lods.values())
+        return [
+            child for child in children
+            if not (isinstance(child, EggGroup) and child.lod is not None)
+            or id(child) in keep_lods
+        ]
+
     def build_tree(self, context, parent=None, inv_matrix=None, under_dart=False):
-        for child in self.children:
+        for child in self._get_build_children(context):
             child.build_tree(context, parent, inv_matrix, under_dart)
 
     def build_armature(self, *args, **kwargs):
         """ Recursively builds up an armature under a group with dart tag.
         This requires the armature to be active and in edit mode. """
 
-        for child in self.children:
+        context = args[0] if args else kwargs.get('context')
+        children = self._get_build_children(context) if context is not None else self.children
+        for child in children:
             child.build_armature(*args, **kwargs)
 
     def apply_default_pose(self, context, pose):
         """ Recursively applies the default pose to the model. """
 
-        for child in self.children:
+        for child in self._get_build_children(context):
             child.apply_default_pose(context, pose)
+
+
+def _root_contains_type(node, node_type):
+    if isinstance(node, node_type):
+        return True
+
+    return any(
+        _root_contains_type(child, node_type)
+        for child in getattr(node, 'children', ())
+    )
+
+
+def _is_animation_only_root(root):
+    return _root_contains_type(root, EggBundle) and \
+        not _root_contains_type(root, EggGroup)
+
+
+def _sort_roots_for_build(roots):
+    return [
+        root for index, root in sorted(
+            enumerate(roots),
+            key=lambda item: (_is_animation_only_root(item[1]), item[0]),
+        )
+    ]
 
 
 class EggGroup(EggGroupNode):
@@ -1464,6 +1609,9 @@ class EggGroup(EggGroupNode):
         self.external_instance = None
         self.has_billboard = False
         self.has_billboard_center = False
+        self.lod = None
+        self.is_collision = False
+        self.has_vertex_ref = False
 
         if isinstance(parent, EggGroup):
             self.blend_mode = parent.blend_mode
@@ -1492,7 +1640,13 @@ class EggGroup(EggGroupNode):
             not self.dart and \
             not self.external_instance and \
             not self.shape_keys and \
+            self.lod is None and \
+            not self._is_collision_group() and \
             not self.is_instance_type()
+
+    def _is_collision_group(self):
+        name = self.name.lower()
+        return self.is_collision or name == 'collisions' or name.startswith('collision')
 
     def get_bvert(self, vert):
         # Vertices are keyed by position only, since normals and UVs are
@@ -1523,6 +1677,8 @@ class EggGroup(EggGroupNode):
             if name in ('collide-mask', 'from-collide-mask', 'into-collide-mask', 'bin', 'draw-order'):
                 # YABEE recognizes these scalars as game properties.
                 self.properties[name] = values[0]
+                if name in ('collide-mask', 'from-collide-mask', 'into-collide-mask'):
+                    self.is_collision = True
             elif name == 'blend':
                 self.blend_mode = values[0].lower().replace('-', '_')
             elif name == 'blendop-a':
@@ -1539,7 +1695,11 @@ class EggGroup(EggGroupNode):
                 self.blend_color[3] = parse_number(values[0])
 
         elif type in ('COLLIDE', 'OBJECTTYPE'):
-            self.properties[orig_type] = values[0]
+            self.properties[orig_type] = ' '.join(values)
+            if type == 'COLLIDE':
+                self.is_collision = True
+            elif values and values[0].lower() in ('barrier', 'collision', 'collision-solid', 'trigger'):
+                self.is_collision = True
 
         elif type == 'TAG':
             # Odd, but the reference .egg parser really intentionally joins
@@ -1550,6 +1710,7 @@ class EggGroup(EggGroupNode):
             return EggTransform()
 
         elif type == 'VERTEXREF':
+            self.has_vertex_ref = True
             vertex_ref = EggGroupVertexRef([int(v) for v in values])
             context.group_vertex_refs.append((self.name, vertex_ref))
             return vertex_ref
@@ -1567,6 +1728,9 @@ class EggGroup(EggGroupNode):
 
         elif type == 'BILLBOARDCENTER':
             self.has_billboard_center = True
+
+        elif type == 'SWITCHCONDITION':
+            return EggSwitchCondition()
 
         return EggGroupNode.begin_child(self, context, type, name, values)
 
@@ -1626,6 +1790,10 @@ class EggGroup(EggGroupNode):
 
             self.any_geometry_below |= child.any_geometry_below
             self.has_default_pose |= child.has_default_pose
+
+        elif isinstance(child, EggSwitchCondition):
+            if child.distance is not None:
+                self.lod = child.distance
 
         return EggGroupNode.end_child(self, context, type, name, child)
 
@@ -1727,6 +1895,9 @@ class EggGroup(EggGroupNode):
         This needs to happen after adding all the children so that we fully
         know the parent-child hierarchy and transforms. """
 
+        if not context.settings.import_collision_meshes and self._is_collision_group():
+            return
+
         data = None
         self.mesh_object = None
         if self.mesh:
@@ -1768,7 +1939,7 @@ class EggGroup(EggGroupNode):
         if self._is_structural_empty_group(data):
             if not inv_matrix:
                 inv_matrix = context.inv_cs_matrix
-            for child in self.children:
+            for child in self._get_build_children(context):
                 child.build_tree(context, parent, inv_matrix, under_dart or self.dart)
             return
 
@@ -1834,7 +2005,7 @@ class EggGroup(EggGroupNode):
             scene_objects.link(self.mesh_object)
 
         # Recurse.
-        for child in self.children:
+        for child in self._get_build_children(context):
             child.build_tree(context, object, inv_matrix, under_dart or self.dart)
 
         # Awkward, but it seems there's no other way to set a game property
@@ -1926,6 +2097,7 @@ class EggJoint(EggGroup):
         bone.parent = parent
         bone.tail = Vector((0, 1, 0))
         bone.matrix = matrix
+        _configure_bone_deform_state(context, bone, self.has_vertex_ref)
         self.bone_name = bone.name
 
         # Find the closest child that lies directly along the length of this
@@ -1939,7 +2111,7 @@ class EggJoint(EggGroup):
         average_dist = 0.0
         num_direct_children = 0
 
-        for child in self.children:
+        for child in self._get_build_children(context):
             # Recurse.  It will return a bone if the child is an EggJoint.
             child_bone = child.build_armature(context, armature, bone, matrix)
             if child_bone:
@@ -2063,11 +2235,12 @@ class EggBundle(EggTable):
         EggTable.__init__(self, name)
         self.skeleton = None
         self.morph = None
+        self.action_datablock = None
 
     def end_child(self, context, type, name, child):
-        if child.name == '<skeleton>':
+        if isinstance(child, EggTable) and child.name == '<skeleton>':
             self.skeleton = child
-        elif child.name == 'morph':
+        elif isinstance(child, EggTable) and child.name == 'morph':
             self.morph = child
 
     def build_tree(self, context, parent=None, inv_matrix=None, under_dart=False):
@@ -2077,20 +2250,30 @@ class EggBundle(EggTable):
         if self.skeleton:
             self.action = bpy.data.actions.new(self.name)
             self.action.use_fake_user = True
+            self.action_datablock = context.character_objects.get(self.name)
+            _bind_action_to_datablock(self.action, self.action_datablock)
 
             if self.name:
                 context.bundle_actions[self.name] = self.action
 
-            self.skeleton.build_animations(context, self)
+            if not hasattr(self.action, 'fcurves') and self.action_datablock is None:
+                context.warn("Ignoring animation bundle {} because no matching armature object was found".format(self.name))
+            else:
+                self.skeleton.build_animations(context, self)
 
         if self.morph:
             morph_action = bpy.data.actions.new(self.name)
             morph_action.use_fake_user = True
-            morph_action.id_root = 'KEY'
+            _set_action_id_root(morph_action, 'KEY')
+            morphs = [
+                child for child in self.morph.children
+                if isinstance(child, EggSAnim)
+            ]
+            morph_datablock = _find_shape_key_datablock(child.name for child in morphs)
+            _bind_action_to_datablock(morph_action, morph_datablock)
 
-            for child in self.morph.children:
-                if isinstance(child, EggSAnim):
-                    self.add_morph(morph_action, child)
+            for child in morphs:
+                self.add_morph(context, morph_action, morph_datablock, child)
 
     def build_animations(self, context, bundle):
         context.error("Cannot have <Bundle> under another <Bundle>")
@@ -2103,7 +2286,7 @@ class EggBundle(EggTable):
             context.warn("Ignoring animation targeting non-existent joint {}".format(name))
             return
 
-        fcurves = self.action.fcurves
+        action_datablock = self.action_datablock
         prefix = 'pose.bones["{}"].'.format(name)
 
         # First, convert all per-frame data to matrices.  This is just easier.
@@ -2180,9 +2363,9 @@ class EggBundle(EggTable):
                 matrices[i] = context.transform_matrix(m)
 
         if 'x' in channels or 'y' in channels or 'z' in channels:
-            x_curve = fcurves.new(prefix + 'location', index=0)
-            y_curve = fcurves.new(prefix + 'location', index=1)
-            z_curve = fcurves.new(prefix + 'location', index=2)
+            x_curve = _new_action_fcurve(self.action, action_datablock, prefix + 'location', index=0)
+            y_curve = _new_action_fcurve(self.action, action_datablock, prefix + 'location', index=1)
+            z_curve = _new_action_fcurve(self.action, action_datablock, prefix + 'location', index=2)
             x_curve.keyframe_points.add(num_frames)
             y_curve.keyframe_points.add(num_frames)
             z_curve.keyframe_points.add(num_frames)
@@ -2198,10 +2381,10 @@ class EggBundle(EggTable):
             z_curve.update()
 
         if 'h' in channels or 'p' in channels or 'r' in channels:
-            w_curve = fcurves.new(prefix + 'rotation_quaternion', index=0)
-            x_curve = fcurves.new(prefix + 'rotation_quaternion', index=1)
-            y_curve = fcurves.new(prefix + 'rotation_quaternion', index=2)
-            z_curve = fcurves.new(prefix + 'rotation_quaternion', index=3)
+            w_curve = _new_action_fcurve(self.action, action_datablock, prefix + 'rotation_quaternion', index=0)
+            x_curve = _new_action_fcurve(self.action, action_datablock, prefix + 'rotation_quaternion', index=1)
+            y_curve = _new_action_fcurve(self.action, action_datablock, prefix + 'rotation_quaternion', index=2)
+            z_curve = _new_action_fcurve(self.action, action_datablock, prefix + 'rotation_quaternion', index=3)
             w_curve.keyframe_points.add(num_frames)
             x_curve.keyframe_points.add(num_frames)
             y_curve.keyframe_points.add(num_frames)
@@ -2220,9 +2403,9 @@ class EggBundle(EggTable):
             z_curve.update()
 
         if 'i' in channels or 'j' in channels or 'k' in channels:
-            x_curve = fcurves.new(prefix + 'scale', index=0)
-            y_curve = fcurves.new(prefix + 'scale', index=1)
-            z_curve = fcurves.new(prefix + 'scale', index=2)
+            x_curve = _new_action_fcurve(self.action, action_datablock, prefix + 'scale', index=0)
+            y_curve = _new_action_fcurve(self.action, action_datablock, prefix + 'scale', index=1)
+            z_curve = _new_action_fcurve(self.action, action_datablock, prefix + 'scale', index=2)
             x_curve.keyframe_points.add(num_frames)
             y_curve.keyframe_points.add(num_frames)
             z_curve.keyframe_points.add(num_frames)
@@ -2237,11 +2420,14 @@ class EggBundle(EggTable):
             y_curve.update()
             z_curve.update()
 
-    def add_morph(self, action, data):
+    def add_morph(self, context, action, datablock, data):
         """ Adds the curve for a morph target to this bundle's action. """
 
-        fcurves = action.fcurves
-        curve = fcurves.new('key_blocks["{}"].value'.format(data.name), index=0)
+        if not hasattr(action, 'fcurves') and datablock is None:
+            context.warn("Ignoring morph animation {} because no matching shape key datablock was found".format(data.name))
+            return
+
+        curve = _new_action_fcurve(action, datablock, 'key_blocks["{}"].value'.format(data.name), index=0)
         keyframe_points = curve.keyframe_points
         keyframe_points.add(len(data.values))
 

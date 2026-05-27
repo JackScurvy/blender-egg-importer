@@ -55,6 +55,17 @@ class IMPORT_OT_egg(bpy.types.Operator, ImportHelper):
     import_texture_settings: props.BoolProperty(name="Texture settings", default=True, description="Import texture filter and wrapping settings.")
     import_alpha_masks: props.BoolProperty(name="Alpha masks", default=True, description="Import separate alpha-file textures and connect them to material alpha.")
     validate_meshes: props.BoolProperty(name="Validate meshes", default=True, description="Run Blender mesh validation to clean duplicate or invalid geometry after import.")
+    lod_mode: props.EnumProperty(
+        name="LODs",
+        default='ALL',
+        description="Choose how Panda3D LOD groups are imported.",
+        items=(
+            ('ALL', "All LODs", "Import every LOD group."),
+            ('HIGHEST', "Highest only", "Import only the closest/highest-detail LOD from each LOD set."),
+        ),
+    )
+    import_collision_meshes: props.BoolProperty(name="Collision meshes", default=True, description="Import groups marked with Collide/collision metadata.")
+    hide_unweighted_bones: props.BoolProperty(name="Hide helper bones", default=True, description="Hide imported bones that do not have direct vertex weights. These bones are still kept for animation.")
 
     def execute(self, context):
         context = importer.EggContext()
@@ -72,6 +83,9 @@ class IMPORT_OT_egg(bpy.types.Operator, ImportHelper):
         context.settings.import_texture_settings = self.import_texture_settings
         context.settings.import_alpha_masks = self.import_alpha_masks
         context.settings.validate_meshes = self.validate_meshes
+        context.settings.lod_mode = self.lod_mode
+        context.settings.import_collision_meshes = self.import_collision_meshes
+        context.settings.hide_unweighted_bones = self.hide_unweighted_bones
         roots = []
 
         for file in self.files:
@@ -79,7 +93,7 @@ class IMPORT_OT_egg(bpy.types.Operator, ImportHelper):
             root = context.read_file(path)
             roots.append(root)
 
-        for root in roots:
+        for root in importer._sort_roots_for_build(roots):
             root.build_tree(context)
         context.assign_vertex_groups()
 
@@ -118,6 +132,11 @@ class IMPORT_OT_egg(bpy.types.Operator, ImportHelper):
         row = layout.row()
         row.prop(self, "import_alpha_masks")
         row.prop(self, "validate_meshes")
+        row = layout.row()
+        row.prop(self, "lod_mode")
+        row.prop(self, "import_collision_meshes")
+        row = layout.row()
+        row.prop(self, "hide_unweighted_bones")
 
 
 def menu_func(self, context):
